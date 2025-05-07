@@ -25,8 +25,16 @@ import { stdioToWs } from './gateways/stdioToWs.js'
 import { headers } from './lib/headers.js'
 import { corsOrigin } from './lib/corsOrigin.js'
 
-const log = (...args: any[]) => console.log('[supergateway]', ...args)
-const logStderr = (...args: any[]) => console.error('[supergateway]', ...args)
+// Prefix logs with 'bt-supergateway' and formatted timestamp
+function formatTimestamp(): string {
+  const iso = new Date().toISOString()
+  const [date, timeWithMs] = iso.split('T')
+  const time = timeWithMs.split('.')[0]
+  return `${date} ${time}`
+}
+const prefix = () => `[bt-supergateway ${formatTimestamp()}]`
+const log = (...args: any[]) => console.log(prefix(), ...args)
+const logStderr = (...args: any[]) => console.error(prefix(), ...args)
 
 const noneLogger: Logger = {
   info: () => {},

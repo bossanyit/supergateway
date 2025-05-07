@@ -100,7 +100,9 @@ export async function stdioToSse(args: StdioToSseArgs) {
   }
 
   app.get(ssePath, async (req, res) => {
-    logger.info(`New SSE connection from ${req.ip}`)
+    logger.info(
+      `SSE GET ${req.method} ${req.originalUrl} from ${req.ip} headers: ${JSON.stringify(req.headers)}`,
+    )
 
     setResponseHeaders({
       res,
@@ -133,10 +135,13 @@ export async function stdioToSse(args: StdioToSseArgs) {
     const sessionId = sseTransport.sessionId as string
     sessions[sessionId] = { transport: sseTransport, response: res, child }
 
+    // Log child spawn for this session
+    logger.info(`Spawned child (pid ${child.pid}) for session ${sessionId}`)
+
     // Handle child exit
     child.on('exit', (code, signal) => {
       logger.error(
-        `Child exited (session ${sessionId}): code=${code}, signal=${signal}`,
+        `[Child exited (session ${sessionId}): code=${code}, signal=${signal}`,
       )
       delete sessions[sessionId]
     })
@@ -188,7 +193,13 @@ export async function stdioToSse(args: StdioToSseArgs) {
 
   // Handle POST messages per session
   app.post(messagePath, (async (req, res, next) => {
+    // Log incoming POST with timestamp, URL, headers, and body
     const sessionId = req.query.sessionId as string
+    logger.info(
+      `POST ${req.method} ${req.originalUrl} session=${sessionId} headers:${JSON.stringify(
+        req.headers,
+      )} body:${JSON.stringify(req.body)}`,
+    )
     setResponseHeaders({ res, headers })
     if (!sessionId) {
       return res.status(400).send('Missing sessionId parameter')
