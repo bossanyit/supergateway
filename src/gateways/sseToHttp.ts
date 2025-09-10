@@ -3,6 +3,8 @@ import bodyParser from 'body-parser'
 import cors, { type CorsOptions } from 'cors'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { Server } from '@modelcontextprotocol/sdk/server/index.js'
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import type {
   JSONRPCMessage,
   JSONRPCRequest,
@@ -18,6 +20,8 @@ import { serializeCorsOrigin } from '../lib/serializeCorsOrigin.js'
 export interface SseToHttpArgs {
   sseUrl: string
   port: number
+  baseUrl: string
+  ssePath: string
   messagePath: string
   logger: Logger
   headers: Record<string, string>
@@ -48,6 +52,8 @@ export async function sseToHttp(args: SseToHttpArgs) {
   const {
     sseUrl,
     port,
+    baseUrl,
+    ssePath,
     messagePath,
     logger,
     headers,
@@ -57,6 +63,8 @@ export async function sseToHttp(args: SseToHttpArgs) {
 
   logger.info(`  - sse: ${sseUrl}`)
   logger.info(`  - port: ${port}`)
+  if (baseUrl) logger.info(`  - baseUrl: ${baseUrl}`)
+  logger.info(`  - ssePath: ${ssePath}`)
   logger.info(`  - messagePath: ${messagePath}`)
   logger.info(
     `  - Headers: ${Object.keys(headers).length ? JSON.stringify(headers) : '(none)'}`,
@@ -70,7 +78,8 @@ export async function sseToHttp(args: SseToHttpArgs) {
 
   onSignals({ logger })
 
-  const sseTransport = new SSEClientTransport(new URL(sseUrl), {
+  // Upstream SSE client transport (to the remote server)
+  const upstreamSseTransport = new SSEClientTransport(new URL(sseUrl), {
     eventSourceInit: {
       fetch: (...props: Parameters<typeof fetch>) => {
         const [url, init = {}] = props
@@ -82,13 +91,12 @@ export async function sseToHttp(args: SseToHttpArgs) {
     },
   })
 
-  sseTransport.onerror = (err) => {
-    logger.error('SSE error:', err)
+  upstreamSseTransport.onerror = (err) => {
+    logger.error('Upstream SSE error:', err)
   }
 
-  sseTransport.onclose = () => {
-    logger.error('SSE connection closed')
-    process.exit(1)
+  upstreamSseTransport.onclose = () => {
+    logger.error('Upstream SSE connection closed')
   }
 
   const app = express()
@@ -108,21 +116,80 @@ export async function sseToHttp(args: SseToHttpArgs) {
     })
   }
 
+  // Track connected SSE sessions
+  const sessions: Record<
+    string,
+    {
+      transport: SSEServerTransport
+      response: express.Response
+    }
+  > = {}
+
+  // Broadcast upstream messages to all connected SSE sessions
+  upstreamSseTransport.onmessage = (msg: JSONRPCMessage) => {
+    const sessionIds = Object.keys(sessions)
+    if (!sessionIds.length) return
+    logger.info(
+      `Upstream SSE → Clients (${sessionIds.length}): ${JSON.stringify(msg)}`,
+    )
+    for (const sessionId of sessionIds) {
+      const session = sessions[sessionId]
+      try {
+        session.transport.send(msg)
+      } catch (err) {
+        logger.error(`Failed to send to session ${sessionId}:`, err)
+      }
+    }
+  }
+
+  // SSE endpoint for clients to subscribe (HTTP MCP SSE)
+  app.get(ssePath, async (_req, res) => {
+    logger.info(`Client subscribed to SSE at ${ssePath}`)
+
+    const server = new Server(
+      { name: 'supergateway', version: getVersion() },
+      { capabilities: {} },
+    )
+
+    const sseServerTransport = new SSEServerTransport(
+      `${baseUrl}${messagePath}`,
+      res,
+    )
+    await server.connect(sseServerTransport)
+
+    const sessionId = sseServerTransport.sessionId as string
+    sessions[sessionId] = { transport: sseServerTransport, response: res }
+
+    sseServerTransport.onclose = () => {
+      logger.info(`SSE client disconnected (session ${sessionId})`)
+      delete sessions[sessionId]
+    }
+
+    sseServerTransport.onerror = (err) => {
+      logger.error(`SSE transport error (session ${sessionId}):`, err)
+      delete sessions[sessionId]
+    }
+
+    res.on('close', () => {
+      logger.info(`HTTP connection closed (session ${sessionId})`)
+      delete sessions[sessionId]
+    })
+  })
+
   const wrapResponse = (req: JSONRPCRequest, payload: object) => ({
     jsonrpc: (req as any).jsonrpc || '2.0',
     id: req.id,
     ...payload,
   })
 
+  // HTTP POST for client → upstream requests
   app.post(messagePath, async (req, res) => {
     const message = req.body as JSONRPCMessage
 
     const isRequest = 'method' in message && 'id' in message
     if (!isRequest) {
-      logger.info('HTTP → SSE (notification):', message)
+      logger.info('HTTP → Upstream (notification):', message)
       try {
-        // Best-effort: If the client sends notifications, forward them raw
-        // The SDK Client does not expose a public notify API, so we use request with z.any() and ignore response if no id
         await sseClient?.request(message as JSONRPCRequest, z.any())
         res.status(204).end()
       } catch (err) {
@@ -133,7 +200,7 @@ export async function sseToHttp(args: SseToHttpArgs) {
     }
 
     const reqMsg = message as JSONRPCRequest
-    logger.info('HTTP → SSE (request):', reqMsg)
+    logger.info('HTTP → Upstream (request):', reqMsg)
 
     try {
       if (!sseClient) {
@@ -146,12 +213,12 @@ export async function sseToHttp(args: SseToHttpArgs) {
           sseClient.request = (async (
             ...args: Parameters<typeof boundOriginal>
           ) => {
-            const res = await boundOriginal(...args)
-            initializeResult = res
-            return res as any
+            const resReq = await boundOriginal(...args)
+            initializeResult = resReq
+            return resReq as any
           }) as typeof sseClient.request
 
-          await sseClient.connect(sseTransport)
+          await sseClient.connect(upstreamSseTransport)
           sseClient.request = originalRequest
 
           // If the first request was initialize, respond with captured initializeResult
@@ -174,12 +241,14 @@ export async function sseToHttp(args: SseToHttpArgs) {
           res.json(response)
           return
         } else {
-          logger.info('SSE client not initialized, creating default client')
+          logger.info(
+            'Upstream SSE client not initialized, creating default client',
+          )
           sseClient = new Client(
             { name: 'supergateway', version: getVersion() },
             { capabilities: {} },
           )
-          await sseClient.connect(sseTransport)
+          await sseClient.connect(upstreamSseTransport)
         }
       }
 
@@ -218,8 +287,7 @@ export async function sseToHttp(args: SseToHttpArgs) {
 
   app.listen(port, () => {
     logger.info(`Listening on port ${port}`)
-    logger.info(
-      `HTTP JSON-RPC endpoint: http://localhost:${port}${messagePath}`,
-    )
+    logger.info(`SSE endpoint: http://localhost:${port}${ssePath}`)
+    logger.info(`POST messages: http://localhost:${port}${messagePath}`)
   })
 }

@@ -207,6 +207,8 @@ async function main() {
         await sseToHttp({
           sseUrl: argv.sse!,
           port: argv.port,
+          baseUrl: argv.baseUrl,
+          ssePath: argv.ssePath,
           messagePath: argv.messagePath,
           logger,
           headers: headers({ argv, logger }),
