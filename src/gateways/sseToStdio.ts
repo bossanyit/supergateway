@@ -124,10 +124,14 @@ export async function sseToStdio(args: SseToStdioArgs) {
 
             const originalRequest = sseClient.request
 
-            sseClient.request = async function (...args) {
-              result = await originalRequest.apply(this, args)
-              return result
-            }
+            const boundOriginal = originalRequest.bind(sseClient)
+            sseClient.request = (async (
+              ...args: Parameters<typeof boundOriginal>
+            ) => {
+              const res = await boundOriginal(...args)
+              result = res
+              return res as any
+            }) as typeof sseClient.request
 
             await sseClient.connect(sseTransport)
             sseClient.request = originalRequest

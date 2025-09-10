@@ -24,6 +24,7 @@ import { sseToStdio } from './gateways/sseToStdio.js'
 import { stdioToWs } from './gateways/stdioToWs.js'
 import { headers } from './lib/headers.js'
 import { corsOrigin } from './lib/corsOrigin.js'
+import { sseToHttp } from './gateways/sseToHttp.js'
 
 // Prefix logs with 'bt-supergateway' and formatted timestamp
 function formatTimestamp(): string {
@@ -71,7 +72,7 @@ async function main() {
     })
     .option('outputTransport', {
       type: 'string',
-      choices: ['stdio', 'sse', 'ws'],
+      choices: ['stdio', 'sse', 'ws', 'http'],
       default: () => {
         const args = hideBin(process.argv)
 
@@ -201,6 +202,16 @@ async function main() {
             argv,
             logger,
           }),
+        })
+      } else if (argv.outputTransport === 'http') {
+        await sseToHttp({
+          sseUrl: argv.sse!,
+          port: argv.port,
+          messagePath: argv.messagePath,
+          logger,
+          headers: headers({ argv, logger }),
+          corsOrigin: corsOrigin({ argv }),
+          healthEndpoints: argv.healthEndpoint as string[],
         })
       } else {
         logStderr(`Error: sse→${argv.outputTransport} not supported`)
